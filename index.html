@@ -2091,6 +2091,7 @@ body.view-only-mode select[id^="rep-btn-month"]{
                 <option value="Absent">Absent</option>
                 <option value="Half-Day">Half-Day</option>
                 <option value="Overtime">Overtime + Regular</option>
+                <option value="Out Duty">Out Duty (outstation / official work elsewhere)</option>
               </select>
             </div>
             <div class="fg" id="att-ot-field" style="display:none"><label>Overtime Hours</label><input id="att-ot-hrs" type="number" step="0.5" min="0" placeholder="Extra hours beyond shift"/></div>
@@ -2161,7 +2162,7 @@ body.view-only-mode select[id^="rep-btn-month"]{
           <div class="fg"><label>From Date</label><input type="date" id="att-hist-from" oninput="renderAttHistory()"/></div>
           <div class="fg"><label>To Date</label><input type="date" id="att-hist-to" oninput="renderAttHistory()"/></div>
           <div class="fg"><label>Operator</label><select id="att-hist-emp" onchange="renderAttHistory()"><option value="">All</option></select></div>
-          <div class="fg"><label>Status</label><select id="att-hist-status" onchange="renderAttHistory()"><option value="">All</option><option>Present</option><option>Absent</option><option>Half-Day</option><option>Overtime</option></select></div>
+          <div class="fg"><label>Status</label><select id="att-hist-status" onchange="renderAttHistory()"><option value="">All</option><option>Present</option><option>Absent</option><option>Half-Day</option><option>Overtime</option><option>Out Duty</option></select></div>
           <button class="btn btn-outline btn-sm" onclick="clearAttHistFilters()" style="align-self:flex-end">✕ Clear</button>
         </div>
         <!-- Summary row -->
@@ -5759,24 +5760,26 @@ function pcmOpenIssuesFor(matNo){
 // entry's material automatically, no manual step required.
 const PCM_REWORK_CODES=['QA_MFG','QA_SCM','ASS'];
 function pcmAutoLogFromEntry(entry, wo){
-  if(!entry.delayReasonCode || !PCM_REWORK_CODES.includes(entry.delayReasonCode)) return;
-  if(!(+entry.delayHrs>0)) return;
-  if(!wo || !wo.materialNo) return;
+  if(!entry.delayReasonCode || !PCM_REWORK_CODES.includes(entry.delayReasonCode)) return null;
+  if(!(+entry.delayHrs>0)) return null;
+  if(!wo || !wo.materialNo) return null;
   const matNo=wo.materialNo;
   if(!DB.pcmLog) DB.pcmLog=[];
   const existingOpen=DB.pcmLog.find(p=>p.matNo===matNo && p.status==='open');
   const reasonLabel=(DB.delayReasons.find(r=>r.code===entry.delayReasonCode)||{}).label||entry.delayReasonCode;
   if(existingOpen){
     existingOpen.history.push({at:new Date().toISOString(), action:'linked-entry', entryId:entry.id, woNo:entry.woNo, note:entry.remarks||reasonLabel});
-    return;
+    return existingOpen.photo ? null : existingOpen.id; // still offer a photo prompt if this issue has none yet
   }
-  DB.pcmLog.push({
+  const newIssue = {
     id:uid('PCM'), matNo,
     description:`${reasonLabel}${entry.remarks?': '+entry.remarks:''} (WO ${entry.woNo}, Op ${entry.opNo}, ${entry.date})`,
     status:'open', openedAt:new Date().toISOString(), closedAt:null,
     source:'auto', sourceEntryId:entry.id,
     history:[{at:new Date().toISOString(), action:'auto-opened', entryId:entry.id, woNo:entry.woNo}]
-  });
+  };
+  DB.pcmLog.push(newIssue);
+  return newIssue.id;
 }
 
 // One-time backfill: entries logged with a rework delay BEFORE this PCM bridge existed never
@@ -5861,6 +5864,33 @@ function pcmCloseIssue(issueId, matNo){
   showMatDetail(matNo);
 }
 
+// Attaches a photo to an ALREADY-EXISTING issue — used by both the inline prompt right after
+// logging a delay entry, and the "Add Photo" button on any issue in the material detail view
+// (covers issues that were auto-created with no photo, or where the prompt was skipped).
+function pcmAddPhotoToIssue(issueId, evt, fromPrompt){
+  const file=evt.target.files[0]; if(!file) return;
+  const issue=(DB.pcmLog||[]).find(p=>p.id===issueId);
+  if(!issue){ toast('Issue not found','err'); return; }
+  const reader=new FileReader();
+  reader.onload=e=>{
+    const img=new Image();
+    img.onload=()=>{
+      const maxW=800;
+      const scale=Math.min(1, maxW/img.width);
+      const canvas=document.createElement('canvas');
+      canvas.width=img.width*scale; canvas.height=img.height*scale;
+      canvas.getContext('2d').drawImage(img,0,0,canvas.width,canvas.height);
+      issue.photo=canvas.toDataURL('image/jpeg',0.7);
+      saveDB();
+      toast('Photo attached ✓','ok');
+      if(fromPrompt){ const b=document.getElementById('pcm-photo-prompt'); if(b) b.remove(); }
+      else if(typeof showMatDetail==='function') showMatDetail(issue.matNo);
+    };
+    img.src=e.target.result;
+  };
+  reader.readAsDataURL(file);
+}
+
 // Hands the photo + description off to whatever app the person picks (Outlook, WhatsApp,
 // Mail, etc.) via the device's native share sheet — this is a real one-tap share, not a
 // silent auto-send: the person sees and confirms what goes out and to whom, in their own
@@ -5906,6 +5936,7 @@ function pcmMatSectionHtml(matNo){
         <td>${i.closedAt?ppcFmtDate(i.closedAt.slice(0,10)):'—'}</td>
         <td style="white-space:nowrap">
           ${i.status==='open'?`<button class="btn btn-outline btn-sm" onclick="pcmCloseIssue('${i.id}','${matNo}')">Mark Closed</button>`:''}
+          ${!i.photo?`<label class="btn btn-outline btn-sm" style="cursor:pointer">📷 Add Photo<input type="file" accept="image/*" capture="environment" style="display:none" onchange="pcmAddPhotoToIssue('${i.id}', event, false)"/></label>`:''}
           <button class="btn btn-outline btn-sm" onclick="pcmShareIssue('${i.id}')">📤 Share</button>
         </td>
       </tr>`).join('')}</tbody>
@@ -6364,7 +6395,7 @@ function saveEntry(andNew=false){
   // update WO status
   const wo=getWO(woNo);
   if(wo&&wo.status==='Open') wo.status='In Progress';
-  pcmAutoLogFromEntry(entry, wo);
+  const pcmIssueIdNeedingPhoto = pcmAutoLogFromEntry(entry, wo);
   _pendingActivityAction = `logged entry for ${woNo}${wo?.saType?' ('+wo.saType+')':''} — ${actualHrs} hrs`;
   saveDB();
   renderRecentEntries();
@@ -6383,8 +6414,29 @@ function saveEntry(andNew=false){
   }
 
   toast('Entry saved ✓');
+  if(pcmIssueIdNeedingPhoto) pcmOfferPhotoPrompt(pcmIssueIdNeedingPhoto, matNoForPcmPrompt(woNo));
   if(andNew){ resetEntryForm(); document.getElementById('ent-date').value=date; }
   else resetEntryForm();
+}
+
+function matNoForPcmPrompt(woNo){ const w=getWO(woNo); return w?w.materialNo:''; }
+
+// Offers to attach a photo to a rework/PCM issue right where the delay was just logged, in
+// Production Entry — instead of making the person navigate to Masters → Materials to find
+// it afterward. Reuses the same camera-capture + compress logic as the manual "+ Log Issue"
+// flow. Skippable — a photo is a nice-to-have, not a requirement to save the entry itself.
+function pcmOfferPhotoPrompt(issueId, matNo){
+  const box=document.createElement('div');
+  box.id='pcm-photo-prompt';
+  box.style.cssText='position:fixed;bottom:20px;right:20px;z-index:9997;background:white;border:1px solid var(--border);border-radius:10px;box-shadow:0 8px 24px rgba(0,0,0,.15);padding:14px 16px;max-width:300px';
+  box.innerHTML=`
+    <div style="font-size:12.5px;font-weight:700;color:var(--navy);margin-bottom:6px">📷 Attach a photo of this issue?</div>
+    <div style="font-size:11px;color:var(--text3);margin-bottom:10px">Material ${matNo} — rework/PCM issue just logged.</div>
+    <input type="file" id="pcm-prompt-photo-input" accept="image/*" capture="environment" style="display:block;margin-bottom:8px;font-size:11px" onchange="pcmAddPhotoToIssue('${issueId}', event, true)"/>
+    <button class="btn btn-ghost btn-sm" style="width:100%" onclick="document.getElementById('pcm-photo-prompt').remove()">Skip</button>
+  `;
+  document.body.appendChild(box);
+  setTimeout(()=>{ const b=document.getElementById('pcm-photo-prompt'); if(b) b.remove(); }, 30000);
 }
 
 function saveAndNew(){ saveEntry(true); }
@@ -9568,16 +9620,18 @@ function renderAttTodaySummary(){
   const present=todayAtt.filter(a=>a.status==='Present'||a.status==='Overtime').length;
   const absent=todayAtt.filter(a=>a.status==='Absent').length;
   const half=todayAtt.filter(a=>a.status==='Half-Day').length;
+  const outDuty=todayAtt.filter(a=>a.status==='Out Duty').length;
   const otHrs=todayAtt.reduce((s,a)=>s+(+a.otHrs||0),0);
   el.innerHTML=`<div class="kpi-row" style="margin-bottom:10px">
     <div class="kpi green"><div class="kpi-val">${present}</div><div class="kpi-lbl">Present</div></div>
     <div class="kpi red"><div class="kpi-val">${absent}</div><div class="kpi-lbl">Absent</div></div>
     <div class="kpi"><div class="kpi-val">${half}</div><div class="kpi-lbl">Half-Day</div></div>
+    <div class="kpi" style="background:#e0e7ff"><div class="kpi-val">${outDuty}</div><div class="kpi-lbl">Out Duty</div></div>
     <div class="kpi amber"><div class="kpi-val">${fmt(otHrs,1)}</div><div class="kpi-lbl">OT Hours</div></div>
   </div>
   <div class="tbl-wrap"><table><thead><tr><th>Operator</th><th>Status</th><th>OT Hrs</th><th>Remarks</th></tr></thead><tbody>
     ${todayAtt.map(a=>`<tr><td>${empMap[a.empId]||a.empId}</td>
-      <td><span class="badge ${a.status==='Present'||a.status==='Overtime'?'b-green':a.status==='Absent'?'b-red':'b-amber'}">${a.status}</span></td>
+      <td><span class="badge ${a.status==='Present'||a.status==='Overtime'?'b-green':a.status==='Absent'?'b-red':a.status==='Out Duty'?'b-navy':'b-amber'}">${a.status}</span></td>
       <td>${+a.otHrs>0?a.otHrs:'—'}</td><td>${a.remarks||'—'}</td></tr>`).join('')}
   </tbody></table></div>`;
   renderAttTodaySAWise(todayAtt, empMap, today);
